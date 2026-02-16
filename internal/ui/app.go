@@ -118,11 +118,134 @@ func compactStatus(line string) string {
 	return fmt.Sprintf("Downloading %s%%", pct)
 }
 
-func scanAndLog(r io.Reader, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex) {
+type downloadProgressTracker struct {
+	mu            sync.Mutex
+	totalStages   int
+	stageIndex    int
+	hasStage      bool
+	stageProgress float64
+	seenDest      map[string]struct{}
+}
+
+func newDownloadProgressTracker(quality string, subOpt *downloader.SubOption, playlist bool) *downloadProgressTracker {
+	if playlist {
+		return nil
+	}
+	stages := 1
+	if quality != "Audio Only" {
+		stages = 2
+	}
+	if subOpt != nil {
+		stages++
+	}
+	if stages < 1 {
+		stages = 1
+	}
+	return &downloadProgressTracker{
+		totalStages: stages,
+		seenDest:    make(map[string]struct{}),
+	}
+}
+
+func (t *downloadProgressTracker) update(rawLine string) (float64, string, bool) {
+	if t == nil {
+		return 0, "", false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	line := strings.TrimSpace(rawLine)
+	const destPrefix = "[download] Destination:"
+	if strings.HasPrefix(line, destPrefix) {
+		dest := strings.TrimSpace(strings.TrimPrefix(line, destPrefix))
+		if _, ok := t.seenDest[dest]; !ok {
+			t.seenDest[dest] = struct{}{}
+			if !t.hasStage {
+				t.hasStage = true
+				t.stageIndex = 0
+				t.stageProgress = 0
+			} else if t.stageIndex < t.totalStages-1 {
+				t.stageIndex++
+				t.stageProgress = 0
+			}
+		}
+		v := float64(t.stageIndex) / float64(t.totalStages)
+		return v, fmt.Sprintf("Downloading (%d/%d)...", t.stageIndex+1, t.totalStages), true
+	}
+
+	if p := parseProgress(rawLine); p >= 0 && t.hasStage {
+		if p < t.stageProgress {
+			p = t.stageProgress
+		}
+		t.stageProgress = p
+		v := (float64(t.stageIndex) + p) / float64(t.totalStages)
+		return v, compactStatus(rawLine), true
+	}
+
+	if strings.Contains(line, "[Merger]") {
+		v := (float64(t.totalStages) - 0.1) / float64(t.totalStages)
+		return v, "Merging formats...", true
+	}
+	if strings.Contains(line, "[EmbedSubtitle]") {
+		v := (float64(t.totalStages) - 0.05) / float64(t.totalStages)
+		return v, "Embedding subtitles...", true
+	}
+
+	return 0, "", false
+}
+
+func shouldShowInUserLog(rawLine string) bool {
+	line := strings.TrimSpace(strings.ReplaceAll(rawLine, "\r", ""))
+	if line == "" {
+		return false
+	}
+	if strings.Contains(line, "[download]") && strings.Contains(line, "% of") {
+		return false
+	}
+
+	if strings.HasPrefix(line, "WARNING:") || strings.HasPrefix(line, "ERROR:") {
+		return true
+	}
+	if strings.HasPrefix(line, "[youtube]") {
+		return strings.Contains(line, "Extracting URL")
+	}
+	if strings.HasPrefix(line, "[info]") {
+		return strings.Contains(line, "Downloading subtitles:") ||
+			strings.Contains(line, "Downloading 1 format(s):") ||
+			strings.Contains(line, "Downloading 2 format(s):") ||
+			strings.Contains(line, "Writing video subtitles to:")
+	}
+	if strings.Contains(line, "[SubtitlesConvertor]") ||
+		strings.Contains(line, "[Merger]") ||
+		strings.Contains(line, "[EmbedSubtitle]") ||
+		strings.HasPrefix(line, "Deleting original file") {
+		return true
+	}
+	if strings.HasPrefix(line, "[download] Destination:") {
+		return true
+	}
+	return false
+}
+
+func scanAndLog(r io.Reader, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex, onProgress func(string) (float64, string, bool)) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		rawLine := sc.Text()
 		appendNerdLog(nerdLogBox, rawLine, mu)
+		if onProgress != nil {
+			if p, s, ok := onProgress(rawLine); ok {
+				runOnMain(func() {
+					progress.SetValue(p)
+					if strings.TrimSpace(s) != "" {
+						status.SetText(s)
+					}
+				})
+			}
+		}
+		if !shouldShowInUserLog(rawLine) {
+			continue
+		}
 		line := rawLine
 		if len(line) > maxLogLineLen {
 			line = line[:maxLogLineLen] + " ..."
@@ -137,12 +260,6 @@ func scanAndLog(r io.Reader, logBox *widget.Entry, nerdLogBox *widget.Entry, sta
 			})
 		}
 
-		p := parseProgress(rawLine)
-		if p >= 0 {
-			runOnMain(func() {
-				progress.SetValue(p)
-			})
-		}
 	}
 	if err := sc.Err(); err != nil {
 		appendLog(logBox, fmt.Sprintf("log stream error: %v", err), mu)
@@ -746,17 +863,19 @@ func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, in
 		return
 	}
 
+	tracker := newDownloadProgressTracker(quality, subOpt, playlist)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		scanAndLog(stdout, logBox, nerdLogBox, status, progress, mu)
+		scanAndLog(stdout, logBox, nerdLogBox, status, progress, mu, tracker.update)
 	}()
 
 	go func() {
 		defer wg.Done()
-		scanAndLog(stderr, logBox, nerdLogBox, status, progress, mu)
+		scanAndLog(stderr, logBox, nerdLogBox, status, progress, mu, tracker.update)
 	}()
 
 	err = cmd.Wait()
@@ -851,6 +970,34 @@ func RunApp(assets Assets) {
 			})
 			appendLog(logBox, "Download folder: "+downloadDir, &logMu)
 		}, w)
+	})
+	openFolder := widget.NewButton("Open Folder", func() {
+		target := strings.TrimSpace(downloadDir)
+		if target == "" {
+			appendLog(logBox, "No download folder selected.", &logMu)
+			runOnMain(func() { status.SetText("No download folder selected") })
+			return
+		}
+		info, err := os.Stat(target)
+		if err != nil || !info.IsDir() {
+			appendLog(logBox, "Download folder does not exist: "+target, &logMu)
+			runOnMain(func() { status.SetText("Download folder missing") })
+			return
+		}
+
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "windows":
+			cmd = exec.Command("explorer", target)
+		case "darwin":
+			cmd = exec.Command("open", target)
+		default:
+			cmd = exec.Command("xdg-open", target)
+		}
+		if err := cmd.Start(); err != nil {
+			appendLog(logBox, fmt.Sprintf("Failed to open folder: %v", err), &logMu)
+			runOnMain(func() { status.SetText("Failed to open folder") })
+		}
 	})
 
 	var toolsReady atomic.Bool
@@ -950,15 +1097,31 @@ func RunApp(assets Assets) {
 	})
 	btn.Disable()
 	go func() {
-		runOnMain(func() { status.SetText("Checking required tools...") })
+		runOnMain(func() {
+			status.SetText("Checking required tools...")
+			progress.SetValue(0.05)
+		})
 		appendLog(logBox, "Required tools check...", &logMu)
+		for _, tool := range []string{"yt-dlp.exe", "ffmpeg.exe"} {
+			if path, err := downloader.BinaryPath(tool); err == nil {
+				appendNerdLog(nerdLogBox, "[setup] check exists "+path, &logMu)
+			} else {
+				appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] resolve path for %s failed: %v", tool, err), &logMu)
+			}
+		}
 		missing, err := checkMissingTools()
 		if err != nil {
 			appendLog(logBox, fmt.Sprintf("Failed to check required tools: %v", err), &logMu)
 			runOnMain(func() { status.SetText("Tool check failed") })
 			return
 		}
+		if len(missing) == 0 {
+			appendNerdLog(nerdLogBox, "[setup] all required tools present", &logMu)
+		} else {
+			appendNerdLog(nerdLogBox, "[setup] missing tools: "+strings.Join(missing, ", "), &logMu)
+		}
 		appendLog(logBox, "Required tools check done.", &logMu)
+		runOnMain(func() { progress.SetValue(0.15) })
 		freshYTDLPDownloaded := false
 		if len(missing) > 0 {
 			appendLog(logBox, "Missing required tools: "+strings.Join(missing, ", "), &logMu)
@@ -968,8 +1131,13 @@ func RunApp(assets Assets) {
 				return
 			}
 			runOnMain(func() { status.SetText("Downloading required tools...") })
-			for _, tool := range missing {
+			totalMissing := len(missing)
+			for i, tool := range missing {
+				startP := 0.20 + (float64(i)/float64(totalMissing))*0.50
+				doneP := 0.20 + (float64(i+1)/float64(totalMissing))*0.50
+				runOnMain(func() { progress.SetValue(startP) })
 				appendLog(logBox, "Downloading "+tool+"...", &logMu)
+				appendNerdLog(nerdLogBox, "[setup] ensure "+tool, &logMu)
 				var data []byte
 				switch tool {
 				case "yt-dlp.exe":
@@ -984,6 +1152,8 @@ func RunApp(assets Assets) {
 					return
 				}
 				appendLog(logBox, tool+" is ready.", &logMu)
+				appendNerdLog(nerdLogBox, "[setup] "+tool+" ready", &logMu)
+				runOnMain(func() { progress.SetValue(doneP) })
 			}
 		}
 		ytdlpPath, err := downloader.BinaryPath("yt-dlp.exe")
@@ -1005,11 +1175,12 @@ func RunApp(assets Assets) {
 		if freshYTDLPDownloaded {
 			appendLog(logBox, "yt-dlp update check skipped (fresh install).", &logMu)
 			appendLog(logBox, "yt-dlp update check done.", &logMu)
+			runOnMain(func() { progress.SetValue(0.95) })
 		} else {
 			appendLog(logBox, "yt-dlp update check...", &logMu)
 			runOnMain(func() {
 				status.SetText("Checking yt-dlp updates...")
-				progress.SetValue(0.05)
+				progress.SetValue(0.75)
 			})
 			appendNerdLog(nerdLogBox, "> "+formatCommandLine(preparedYTDLPPath, []string{"--version"}), &logMu)
 			appendNerdLog(nerdLogBox, "> GET https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", &logMu)
@@ -1021,22 +1192,22 @@ func RunApp(assets Assets) {
 				case strings.Contains(lower, "updating yt-dlp"):
 					runOnMain(func() {
 						status.SetText("Updating yt-dlp...")
-						progress.SetValue(0.2)
+						progress.SetValue(0.85)
 					})
 				case strings.Contains(lower, "update complete"):
 					runOnMain(func() {
 						status.SetText("yt-dlp update complete")
-						progress.SetValue(0.35)
+						progress.SetValue(0.95)
 					})
 				case strings.Contains(lower, "up to date"):
 					runOnMain(func() {
 						status.SetText("yt-dlp is up to date")
-						progress.SetValue(0.35)
+						progress.SetValue(0.95)
 					})
 				case strings.Contains(lower, "could not check latest yt-dlp version"):
 					runOnMain(func() {
 						status.SetText("Could not check yt-dlp updates")
-						progress.SetValue(0.1)
+						progress.SetValue(0.80)
 					})
 				}
 			})
@@ -1065,7 +1236,7 @@ func RunApp(assets Assets) {
 	controls := container.NewVBox(
 		widget.NewLabel("Portable yt-dlp Downloader"),
 		url,
-		chooseFolder,
+		container.NewHBox(chooseFolder, openFolder),
 		qualitySelect,
 		profileSelect,
 		nameWithChannel,
