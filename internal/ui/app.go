@@ -19,6 +19,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 
 	"ytgui/internal/downloader"
@@ -64,6 +65,36 @@ func appendLog(logBox *widget.Entry, msg string, mu *sync.Mutex) {
 	})
 }
 
+func appendNerdLog(nerdLogBox *widget.Entry, msg string, mu *sync.Mutex) {
+	if nerdLogBox == nil {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	runOnMain(func() {
+		nerdLogBox.SetText(nerdLogBox.Text + msg + "\n")
+	})
+}
+
+func quoteArg(arg string) string {
+	if arg == "" {
+		return "\"\""
+	}
+	if strings.ContainsAny(arg, " \t\n\"") {
+		return strconv.Quote(arg)
+	}
+	return arg
+}
+
+func formatCommandLine(exe string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, quoteArg(exe))
+	for _, arg := range args {
+		parts = append(parts, quoteArg(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
 func parseProgress(line string) float64 {
 	m := percentRegex.FindStringSubmatch(line)
 	if len(m) >= 3 {
@@ -87,10 +118,11 @@ func compactStatus(line string) string {
 	return fmt.Sprintf("Downloading %s%%", pct)
 }
 
-func scanAndLog(r io.Reader, logBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex) {
+func scanAndLog(r io.Reader, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		rawLine := sc.Text()
+		appendNerdLog(nerdLogBox, rawLine, mu)
 		line := rawLine
 		if len(line) > maxLogLineLen {
 			line = line[:maxLogLineLen] + " ..."
@@ -608,23 +640,10 @@ func cleanupSubtitleSidecars(videoPath string) int {
 	return deleted
 }
 
-func runYTDLP(url, downloadDir, quality, outputProfile string, includeChannel, playlist bool, subOpt *downloader.SubOption, assets Assets, w fyne.Window, logBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex) {
+func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, includeChannel, playlist bool, subOpt *downloader.SubOption, w fyne.Window, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex) {
 	if runtime.GOOS != "windows" {
 		appendLog(logBox, "This build is intended for Windows only.", mu)
 		runOnMain(func() { status.SetText("Windows build required") })
-		return
-	}
-
-	ytdlp, err := downloader.EnsureBinary("yt-dlp.exe", assets.YTDLP)
-	if err != nil {
-		appendLog(logBox, fmt.Sprintf("Failed to prepare yt-dlp: %v", err), mu)
-		runOnMain(func() { status.SetText("Failed to prepare yt-dlp") })
-		return
-	}
-	ffmpeg, err := downloader.EnsureBinary("ffmpeg.exe", assets.FFmpeg)
-	if err != nil {
-		appendLog(logBox, fmt.Sprintf("Failed to prepare ffmpeg: %v", err), mu)
-		runOnMain(func() { status.SetText("Failed to prepare ffmpeg") })
 		return
 	}
 
@@ -637,6 +656,7 @@ func runYTDLP(url, downloadDir, quality, outputProfile string, includeChannel, p
 		mergeFormat = "mkv"
 	}
 	if !playlist {
+		appendNerdLog(nerdLogBox, "> "+formatCommandLine(ytdlp, []string{"--print", "%(title)s", "--print", "%(uploader)s", "--encoding", "utf-8", "--no-warnings", "--skip-download", "--no-playlist", url}), mu)
 		title, channel, infoErr := downloader.GetVideoInfo(ytdlp, url)
 		if infoErr != nil {
 			appendLog(logBox, fmt.Sprintf("Could not fetch metadata, using template output: %v", infoErr), mu)
@@ -702,6 +722,7 @@ func runYTDLP(url, downloadDir, quality, outputProfile string, includeChannel, p
 	args = append(args, "--merge-output-format", mergeFormat)
 	appendLog(logBox, fmt.Sprintf("Output profile: %s (%s)", outputProfile, strings.ToUpper(mergeFormat)), mu)
 	args = append(args, url)
+	appendNerdLog(nerdLogBox, "> "+formatCommandLine(ytdlp, args), mu)
 	cmd := exec.Command(ytdlp, args...)
 
 	setCmdHideWindow(cmd)
@@ -730,12 +751,12 @@ func runYTDLP(url, downloadDir, quality, outputProfile string, includeChannel, p
 
 	go func() {
 		defer wg.Done()
-		scanAndLog(stdout, logBox, status, progress, mu)
+		scanAndLog(stdout, logBox, nerdLogBox, status, progress, mu)
 	}()
 
 	go func() {
 		defer wg.Done()
-		scanAndLog(stderr, logBox, status, progress, mu)
+		scanAndLog(stderr, logBox, nerdLogBox, status, progress, mu)
 	}()
 
 	err = cmd.Wait()
@@ -761,6 +782,25 @@ func RunApp(assets Assets) {
 	a := app.NewWithID("com.wishall.ytgui")
 	w := a.NewWindow("yt-dlp Portable GUI")
 	w.Resize(fyne.NewSize(600, 400))
+	confirmClose := func() {
+		dialog.ShowConfirm(
+			"Exit",
+			"Close ytgui?",
+			func(ok bool) {
+				if ok {
+					a.Quit()
+				}
+			},
+			w,
+		)
+	}
+	w.SetCloseIntercept(confirmClose)
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{
+		KeyName:  fyne.KeyF4,
+		Modifier: fyne.KeyModifierAlt,
+	}, func(fyne.Shortcut) {
+		confirmClose()
+	})
 
 	url := widget.NewEntry()
 	url.SetPlaceHolder("Paste video URL")
@@ -794,6 +834,8 @@ func RunApp(assets Assets) {
 
 	logBox := widget.NewMultiLineEntry()
 	logBox.Wrapping = fyne.TextWrapWord
+	nerdLogBox := widget.NewMultiLineEntry()
+	nerdLogBox.Wrapping = fyne.TextWrapOff
 	var logMu sync.Mutex
 
 	var chooseFolder *widget.Button
@@ -812,6 +854,8 @@ func RunApp(assets Assets) {
 	})
 
 	var toolsReady atomic.Bool
+	var preparedYTDLPPath string
+	var preparedFFmpegPath string
 	var btn *widget.Button
 	btn = widget.NewButton("Download", func() {
 		if !toolsReady.Load() {
@@ -845,47 +889,22 @@ func RunApp(assets Assets) {
 
 		go func() {
 			defer runOnMain(func() { btn.Enable() })
-
-			ytdlpPath, err := downloader.EnsureBinary("yt-dlp.exe", assets.YTDLP)
-			if err != nil {
-				appendLog(logBox, fmt.Sprintf("Error finding yt-dlp: %v", err), &logMu)
+			ytdlpPath := preparedYTDLPPath
+			ffmpegPath := preparedFFmpegPath
+			if strings.TrimSpace(ytdlpPath) == "" || strings.TrimSpace(ffmpegPath) == "" {
+				appendLog(logBox, "Tools are not ready yet. Please wait.", &logMu)
+				runOnMain(func() { status.SetText("Preparing required tools...") })
 				return
 			}
-
-			runOnMain(func() { status.SetText("Checking yt-dlp updates...") })
-			runOnMain(func() { progress.SetValue(0.05) })
-			downloader.TryUpdateYTDLP(ytdlpPath, func(msg string) {
-				appendLog(logBox, msg, &logMu)
-				lower := strings.ToLower(msg)
-				switch {
-				case strings.Contains(lower, "updating yt-dlp"):
-					runOnMain(func() {
-						status.SetText("Updating yt-dlp...")
-						progress.SetValue(0.2)
-					})
-				case strings.Contains(lower, "update complete"):
-					runOnMain(func() {
-						status.SetText("yt-dlp update complete")
-						progress.SetValue(0.35)
-					})
-				case strings.Contains(lower, "up to date"):
-					runOnMain(func() {
-						status.SetText("yt-dlp is up to date")
-						progress.SetValue(0.35)
-					})
-				case strings.Contains(lower, "could not check latest yt-dlp version"):
-					runOnMain(func() {
-						status.SetText("Could not check yt-dlp updates")
-						progress.SetValue(0.1)
-					})
-				}
-			})
+			appendNerdLog(nerdLogBox, "Tool path: "+ytdlpPath, &logMu)
+			appendNerdLog(nerdLogBox, "Tool path: "+ffmpegPath, &logMu)
 
 			var selectedSub *downloader.SubOption
 			if checkSubs && !selectedPlaylist {
 				runOnMain(func() { status.SetText("Checking subtitles...") })
 				appendLog(logBox, "Fetching subtitle list...", &logMu)
 
+				appendNerdLog(nerdLogBox, "> "+formatCommandLine(ytdlpPath, []string{"--print", "%(subtitles)j", "--print", "%(automatic_captions)j", "--print", "%(language)s", "--encoding", "utf-8", "--no-warnings", "--skip-download", "--no-playlist", downloadURL}), &logMu)
 				opts, err := downloader.GetAvailableSubtitles(ytdlpPath, downloadURL)
 				if err != nil {
 					appendLog(logBox, fmt.Sprintf("Could not list subtitles: %v. Proceeding without.", err), &logMu)
@@ -926,18 +945,21 @@ func RunApp(assets Assets) {
 			})
 			appendLog(logBox, "Starting download...", &logMu)
 
-			runYTDLP(downloadURL, selectedFolder, selectedQuality, selectedProfile, selectedNameWithChannel, selectedPlaylist, selectedSub, assets, w, logBox, status, progress, &logMu)
+			runYTDLP(downloadURL, selectedFolder, selectedQuality, selectedProfile, ytdlpPath, ffmpegPath, selectedNameWithChannel, selectedPlaylist, selectedSub, w, logBox, nerdLogBox, status, progress, &logMu)
 		}()
 	})
 	btn.Disable()
 	go func() {
 		runOnMain(func() { status.SetText("Checking required tools...") })
+		appendLog(logBox, "Required tools check...", &logMu)
 		missing, err := checkMissingTools()
 		if err != nil {
 			appendLog(logBox, fmt.Sprintf("Failed to check required tools: %v", err), &logMu)
 			runOnMain(func() { status.SetText("Tool check failed") })
 			return
 		}
+		appendLog(logBox, "Required tools check done.", &logMu)
+		freshYTDLPDownloaded := false
 		if len(missing) > 0 {
 			appendLog(logBox, "Missing required tools: "+strings.Join(missing, ", "), &logMu)
 			if !askDownloadRequiredTools(w, missing) {
@@ -952,6 +974,7 @@ func RunApp(assets Assets) {
 				switch tool {
 				case "yt-dlp.exe":
 					data = assets.YTDLP
+					freshYTDLPDownloaded = true
 				case "ffmpeg.exe":
 					data = assets.FFmpeg
 				}
@@ -963,9 +986,66 @@ func RunApp(assets Assets) {
 				appendLog(logBox, tool+" is ready.", &logMu)
 			}
 		}
+		ytdlpPath, err := downloader.BinaryPath("yt-dlp.exe")
+		if err != nil {
+			appendLog(logBox, fmt.Sprintf("Failed to resolve yt-dlp path: %v", err), &logMu)
+			runOnMain(func() { status.SetText("Setup failed") })
+			return
+		}
+		ffmpegPath, err := downloader.BinaryPath("ffmpeg.exe")
+		if err != nil {
+			appendLog(logBox, fmt.Sprintf("Failed to resolve ffmpeg path: %v", err), &logMu)
+			runOnMain(func() { status.SetText("Setup failed") })
+			return
+		}
+		preparedYTDLPPath = ytdlpPath
+		preparedFFmpegPath = ffmpegPath
+		appendNerdLog(nerdLogBox, "Prepared tool path: "+preparedYTDLPPath, &logMu)
+		appendNerdLog(nerdLogBox, "Prepared tool path: "+preparedFFmpegPath, &logMu)
+		if freshYTDLPDownloaded {
+			appendLog(logBox, "yt-dlp update check skipped (fresh install).", &logMu)
+			appendLog(logBox, "yt-dlp update check done.", &logMu)
+		} else {
+			appendLog(logBox, "yt-dlp update check...", &logMu)
+			runOnMain(func() {
+				status.SetText("Checking yt-dlp updates...")
+				progress.SetValue(0.05)
+			})
+			appendNerdLog(nerdLogBox, "> "+formatCommandLine(preparedYTDLPPath, []string{"--version"}), &logMu)
+			appendNerdLog(nerdLogBox, "> GET https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", &logMu)
+			downloader.TryUpdateYTDLP(preparedYTDLPPath, func(msg string) {
+				appendLog(logBox, msg, &logMu)
+				appendNerdLog(nerdLogBox, "[yt-dlp-update] "+msg, &logMu)
+				lower := strings.ToLower(msg)
+				switch {
+				case strings.Contains(lower, "updating yt-dlp"):
+					runOnMain(func() {
+						status.SetText("Updating yt-dlp...")
+						progress.SetValue(0.2)
+					})
+				case strings.Contains(lower, "update complete"):
+					runOnMain(func() {
+						status.SetText("yt-dlp update complete")
+						progress.SetValue(0.35)
+					})
+				case strings.Contains(lower, "up to date"):
+					runOnMain(func() {
+						status.SetText("yt-dlp is up to date")
+						progress.SetValue(0.35)
+					})
+				case strings.Contains(lower, "could not check latest yt-dlp version"):
+					runOnMain(func() {
+						status.SetText("Could not check yt-dlp updates")
+						progress.SetValue(0.1)
+					})
+				}
+			})
+			appendLog(logBox, "yt-dlp update check done.", &logMu)
+		}
 		toolsReady.Store(true)
 		runOnMain(func() {
 			status.SetText("Idle")
+			progress.SetValue(0)
 			btn.Enable()
 		})
 	}()
@@ -973,8 +1053,16 @@ func RunApp(assets Assets) {
 	clear := widget.NewButton("Clear", func() {
 		logBox.SetText("")
 	})
+	clearNerd := widget.NewButton("Clear Nerd", func() {
+		nerdLogBox.SetText("")
+	})
 
-	w.SetContent(container.NewVBox(
+	logTabs := container.NewAppTabs(
+		container.NewTabItem("Normal Logs", logBox),
+		container.NewTabItem("Nerd Terminal", nerdLogBox),
+	)
+
+	controls := container.NewVBox(
 		widget.NewLabel("Portable yt-dlp Downloader"),
 		url,
 		chooseFolder,
@@ -983,11 +1071,17 @@ func RunApp(assets Assets) {
 		nameWithChannel,
 		subsCheck,
 		playlistCheck,
-		btn,
-		clear,
+		container.NewHBox(btn, clear, clearNerd),
 		status,
 		progress,
-		logBox,
+	)
+
+	w.SetContent(container.NewBorder(
+		controls,
+		nil,
+		nil,
+		nil,
+		logTabs,
 	))
 
 	w.ShowAndRun()
