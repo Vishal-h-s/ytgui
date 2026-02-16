@@ -1,0 +1,6 @@
+builds
+builds/*
+ffmpeg.exe
+yt-dlp.exe
+win_tools
+win_tools/*
