@@ -32,8 +32,11 @@ func getLocalVersion(path string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func getLatestVersion(client *http.Client) (string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, latestReleaseAPIURL, nil)
+func getLatestVersion(ctx context.Context, client *http.Client) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestReleaseAPIURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -66,8 +69,11 @@ func needsUpdate(local, latest string) bool {
 	return local != "" && latest != "" && local != latest
 }
 
-func downloadLatest(client *http.Client, path string) error {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, latestBinaryURL, nil)
+func downloadLatest(ctx context.Context, client *http.Client, path string, progress DownloadProgressFunc) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestBinaryURL, nil)
 	if err != nil {
 		return err
 	}
@@ -81,6 +87,14 @@ func downloadLatest(client *http.Client, path string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("binary download returned status %s", resp.Status)
 	}
+
+	emitDownloadProgress(progress, DownloadStats{
+		Tool:            "yt-dlp.exe",
+		URL:             latestBinaryURL,
+		Phase:           "start",
+		DownloadedBytes: 0,
+		TotalBytes:      resp.ContentLength,
+	})
 
 	tmp := path + ".new"
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
@@ -101,7 +115,18 @@ func downloadLatest(client *http.Client, path string) error {
 		return fmt.Errorf("downloaded file does not look like a Windows executable")
 	}
 
-	if _, err := io.Copy(out, reader); err != nil {
+	counter := &countingWriter{
+		onAdd: func(downloaded int64) {
+			emitDownloadProgress(progress, DownloadStats{
+				Tool:            "yt-dlp.exe",
+				URL:             latestBinaryURL,
+				Phase:           "downloading",
+				DownloadedBytes: downloaded,
+				TotalBytes:      resp.ContentLength,
+			})
+		},
+	}
+	if _, err := io.Copy(out, io.TeeReader(reader, counter)); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err
@@ -116,34 +141,54 @@ func downloadLatest(client *http.Client, path string) error {
 		os.Remove(tmp)
 		return err
 	}
+	emitDownloadProgress(progress, DownloadStats{
+		Tool:            "yt-dlp.exe",
+		URL:             latestBinaryURL,
+		Phase:           "done",
+		DownloadedBytes: counter.total,
+		TotalBytes:      resp.ContentLength,
+	})
 
 	return nil
 }
 
 func TryUpdateYTDLP(path string, logf func(string)) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	_ = TryUpdateYTDLPWithProgress(path, logf, nil)
+}
+
+func TryUpdateYTDLPWithProgress(path string, logf func(string), progress DownloadProgressFunc) error {
+	return TryUpdateYTDLPWithProgressCtx(context.Background(), path, logf, progress)
+}
+
+func TryUpdateYTDLPWithProgressCtx(ctx context.Context, path string, logf func(string), progress DownloadProgressFunc) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	apiClient := &http.Client{Timeout: 15 * time.Second}
+	downloadClient := &http.Client{Timeout: downloadTimeout}
 
 	local, err := getLocalVersion(path)
 	if err != nil {
 		logf(fmt.Sprintf("Could not read local yt-dlp version: %v", err))
-		return
+		return err
 	}
 
-	latest, err := getLatestVersion(client)
+	latest, err := getLatestVersion(ctx, apiClient)
 	if err != nil {
 		logf(fmt.Sprintf("Could not check latest yt-dlp version: %v", err))
-		return
+		return err
 	}
 
 	if !needsUpdate(local, latest) {
 		logf(fmt.Sprintf("yt-dlp is up to date (%s).", local))
-		return
+		return nil
 	}
 
 	logf(fmt.Sprintf("Updating yt-dlp from %s to %s...", local, latest))
-	if err := downloadLatest(client, path); err != nil {
+	if err := downloadLatest(ctx, downloadClient, path, progress); err != nil {
 		logf(fmt.Sprintf("yt-dlp update failed: %v", err))
-		return
+		return err
 	}
 	logf("yt-dlp update complete.")
+	return nil
 }

@@ -2,10 +2,14 @@ package ui
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -118,6 +122,34 @@ func compactStatus(line string) string {
 	return fmt.Sprintf("Downloading %s%%", pct)
 }
 
+func formatBytes(v int64) string {
+	if v < 0 {
+		return "unknown"
+	}
+	const unit = 1024
+	if v < unit {
+		return fmt.Sprintf("%d B", v)
+	}
+	div, exp := int64(unit), 0
+	for n := v / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(v)/float64(div), "KMGTPE"[exp])
+}
+
+func downloadDisplayName(stats downloader.DownloadStats) string {
+	if u, err := url.Parse(strings.TrimSpace(stats.URL)); err == nil {
+		if n := strings.TrimSpace(path.Base(u.Path)); n != "" && n != "/" && n != "." {
+			return n
+		}
+	}
+	if strings.TrimSpace(stats.Tool) != "" {
+		return strings.TrimSpace(stats.Tool)
+	}
+	return "download"
+}
+
 type downloadProgressTracker struct {
 	mu            sync.Mutex
 	totalStages   int
@@ -195,37 +227,40 @@ func (t *downloadProgressTracker) update(rawLine string) (float64, string, bool)
 	return 0, "", false
 }
 
-func shouldShowInUserLog(rawLine string) bool {
+func userLogSummary(rawLine string) (string, bool) {
 	line := strings.TrimSpace(strings.ReplaceAll(rawLine, "\r", ""))
 	if line == "" {
-		return false
-	}
-	if strings.Contains(line, "[download]") && strings.Contains(line, "% of") {
-		return false
+		return "", false
 	}
 
 	if strings.HasPrefix(line, "WARNING:") || strings.HasPrefix(line, "ERROR:") {
-		return true
+		return line, true
 	}
 	if strings.HasPrefix(line, "[youtube]") {
-		return strings.Contains(line, "Extracting URL")
+		if strings.Contains(line, "Extracting URL") {
+			return "Fetching video information...", true
+		}
+		return "", false
 	}
 	if strings.HasPrefix(line, "[info]") {
-		return strings.Contains(line, "Downloading subtitles:") ||
-			strings.Contains(line, "Downloading 1 format(s):") ||
-			strings.Contains(line, "Downloading 2 format(s):") ||
-			strings.Contains(line, "Writing video subtitles to:")
+		if strings.Contains(line, "Downloading subtitles:") {
+			return "Downloading subtitles...", true
+		}
+		if strings.Contains(line, "Downloading 1 format(s):") || strings.Contains(line, "Downloading 2 format(s):") {
+			return "Downloading media streams...", true
+		}
+		return "", false
 	}
-	if strings.Contains(line, "[SubtitlesConvertor]") ||
-		strings.Contains(line, "[Merger]") ||
-		strings.Contains(line, "[EmbedSubtitle]") ||
-		strings.HasPrefix(line, "Deleting original file") {
-		return true
+	if strings.Contains(line, "[SubtitlesConvertor]") {
+		return "Preparing subtitles...", true
 	}
-	if strings.HasPrefix(line, "[download] Destination:") {
-		return true
+	if strings.Contains(line, "[Merger]") {
+		return "Merging audio/video...", true
 	}
-	return false
+	if strings.Contains(line, "[EmbedSubtitle]") {
+		return "Embedding subtitles...", true
+	}
+	return "", false
 }
 
 func scanAndLog(r io.Reader, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex, onProgress func(string) (float64, string, bool)) {
@@ -243,23 +278,14 @@ func scanAndLog(r io.Reader, logBox *widget.Entry, nerdLogBox *widget.Entry, sta
 				})
 			}
 		}
-		if !shouldShowInUserLog(rawLine) {
+		line, ok := userLogSummary(rawLine)
+		if !ok {
 			continue
 		}
-		line := rawLine
 		if len(line) > maxLogLineLen {
 			line = line[:maxLogLineLen] + " ..."
 		}
 		appendLog(logBox, line, mu)
-
-		if m := progressLineRegex.FindStringSubmatch(rawLine); len(m) > 1 {
-			runOnMain(func() {
-				if s := compactStatus(rawLine); s != "" {
-					status.SetText(s)
-				}
-			})
-		}
-
 	}
 	if err := sc.Err(); err != nil {
 		appendLog(logBox, fmt.Sprintf("log stream error: %v", err), mu)
@@ -271,7 +297,7 @@ func formatFromChoice(choice, outputProfile string) []string {
 		return []string{"-x", "--audio-format", "mp3"}
 	}
 
-	if outputProfile == "Compatibility (H.264/AAC)" {
+	if outputProfile == "Widely Compatible (H.264/AAC)" {
 		switch choice {
 		case "1080p":
 			return []string{"-f", "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/best[vcodec^=avc1][acodec^=mp4a][height<=1080]/bestvideo[height<=1080]+bestaudio/best[height<=1080]"}
@@ -598,7 +624,7 @@ func askDownloadWithoutSubs(w fyne.Window) bool {
 		d := dialog.NewCustomConfirm(
 			"No Subtitles Available",
 			"Download without subtitles",
-			"Abort",
+			"Quit Application",
 			container.NewVBox(
 				widget.NewLabel("No preferred subtitle type is available."),
 				widget.NewLabel("Continue download without subtitles?"),
@@ -636,7 +662,7 @@ func askDownloadRequiredTools(w fyne.Window, missing []string) bool {
 		d := dialog.NewCustomConfirm(
 			"Setup Required",
 			"Download",
-			"Abort",
+			"Quit Application",
 			container.NewVBox(
 				widget.NewLabel(msg),
 				widget.NewLabel("Download now? This should happen only once."),
@@ -757,7 +783,50 @@ func cleanupSubtitleSidecars(videoPath string) int {
 	return deleted
 }
 
-func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, includeChannel, playlist bool, subOpt *downloader.SubOption, w fyne.Window, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex) {
+func cleanupPartialMediaArtifacts(outputPath string) int {
+	if strings.TrimSpace(outputPath) == "" || strings.Contains(outputPath, "%(") {
+		return 0
+	}
+
+	base := strings.TrimSpace(outputPath)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+
+	patterns := []string{
+		base + ".part",
+		base + ".ytdl",
+		base + ".temp",
+		base + ".temp.*",
+		stem + ".f*.part",
+		stem + ".f*.*",
+		stem + ".temp.*",
+	}
+
+	seen := make(map[string]struct{})
+	deleted := 0
+	for _, p := range patterns {
+		matches, err := filepath.Glob(p)
+		if err != nil {
+			continue
+		}
+		for _, f := range matches {
+			if _, ok := seen[f]; ok {
+				continue
+			}
+			seen[f] = struct{}{}
+			info, err := os.Stat(f)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			if err := os.Remove(f); err == nil || os.IsNotExist(err) {
+				deleted++
+			}
+		}
+	}
+
+	return deleted
+}
+
+func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, includeChannel, playlist bool, subOpt *downloader.SubOption, w fyne.Window, logBox *widget.Entry, nerdLogBox *widget.Entry, status *widget.Label, progress *widget.ProgressBar, mu *sync.Mutex, setCancelable func(string, context.CancelFunc) int64, clearCancelable func(int64)) {
 	if runtime.GOOS != "windows" {
 		appendLog(logBox, "This build is intended for Windows only.", mu)
 		runOnMain(func() { status.SetText("Windows build required") })
@@ -769,7 +838,7 @@ func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, in
 		output = filepath.Join(downloadDir, "%(title)s.%(ext)s")
 	}
 	mergeFormat := "mp4"
-	if outputProfile == "Smaller Files (AV1/VP9)" {
+	if outputProfile == "Smaller File Size (AV1/VP9)" {
 		mergeFormat = "mkv"
 	}
 	if !playlist {
@@ -840,7 +909,10 @@ func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, in
 	appendLog(logBox, fmt.Sprintf("Output profile: %s (%s)", outputProfile, strings.ToUpper(mergeFormat)), mu)
 	args = append(args, url)
 	appendNerdLog(nerdLogBox, "> "+formatCommandLine(ytdlp, args), mu)
-	cmd := exec.Command(ytdlp, args...)
+	downloadCtx, cancelDownload := context.WithCancel(context.Background())
+	opID := setCancelable("media download", cancelDownload)
+	defer clearCancelable(opID)
+	cmd := exec.CommandContext(downloadCtx, ytdlp, args...)
 
 	setCmdHideWindow(cmd)
 
@@ -881,6 +953,17 @@ func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, in
 	err = cmd.Wait()
 	wg.Wait()
 	if err != nil {
+		if errors.Is(downloadCtx.Err(), context.Canceled) {
+			if removed := cleanupPartialMediaArtifacts(output); removed > 0 {
+				appendLog(logBox, fmt.Sprintf("Removed %d partial/intermediate file(s).", removed), mu)
+			}
+			appendLog(logBox, "Download canceled by user.", mu)
+			runOnMain(func() {
+				status.SetText("Download canceled")
+				progress.SetValue(0)
+			})
+			return
+		}
 		appendLog(logBox, fmt.Sprintf("yt-dlp exited with error: %v", err), mu)
 		runOnMain(func() { status.SetText("Download failed") })
 		return
@@ -899,7 +982,9 @@ func runYTDLP(url, downloadDir, quality, outputProfile, ytdlp, ffmpeg string, in
 
 func RunApp(assets Assets) {
 	a := app.NewWithID("com.wishall.ytgui")
+	a.SetIcon(appIcon)
 	w := a.NewWindow("yt-dlp Portable GUI")
+	w.SetIcon(appIcon)
 	w.Resize(fyne.NewSize(600, 400))
 	confirmClose := func() {
 		dialog.ShowConfirm(
@@ -936,15 +1021,15 @@ func RunApp(assets Assets) {
 		[]string{"Best", "1080p", "720p", "480p", "Audio Only"},
 		func(string) {},
 	)
-	qualitySelect.SetSelected("Best")
+	qualitySelect.SetSelected("720p")
 	profileSelect := widget.NewSelect(
-		[]string{"Compatibility (H.264/AAC)", "Smaller Files (AV1/VP9)"},
+		[]string{"Widely Compatible (H.264/AAC)", "Smaller File Size (AV1/VP9)"},
 		func(string) {},
 	)
-	profileSelect.SetSelected("Compatibility (H.264/AAC)")
+	profileSelect.SetSelected("Widely Compatible (H.264/AAC)")
 	nameWithChannel := widget.NewCheck("Include channel name in filename", func(bool) {})
 	playlistCheck := widget.NewCheck("Download Playlist", func(bool) {})
-	subsCheck := widget.NewCheck("Download Subtitles (Ask which)", func(bool) {})
+	subsCheck := widget.NewCheck("Download Subtitles", func(bool) {})
 	subsCheck.SetChecked(false)
 	nameWithChannel.SetChecked(true)
 	status := widget.NewLabel("Idle")
@@ -956,6 +1041,74 @@ func RunApp(assets Assets) {
 	nerdLogBox := widget.NewMultiLineEntry()
 	nerdLogBox.Wrapping = fyne.TextWrapOff
 	var logMu sync.Mutex
+	var cancelMu sync.Mutex
+	var cancelSeq int64
+	var activeCancel context.CancelFunc
+	var activeCancelLabel string
+	var cancelDownloadBtn *widget.Button
+
+	setCancelable := func(label string, cancel context.CancelFunc) int64 {
+		cancelMu.Lock()
+		cancelSeq++
+		opID := cancelSeq
+		activeCancel = cancel
+		activeCancelLabel = label
+		cancelMu.Unlock()
+		runOnMain(func() {
+			cancelDownloadBtn.Enable()
+		})
+		return opID
+	}
+
+	clearCancelable := func(opID int64) {
+		cancelMu.Lock()
+		if opID != cancelSeq {
+			cancelMu.Unlock()
+			return
+		}
+		activeCancel = nil
+		activeCancelLabel = ""
+		cancelMu.Unlock()
+		runOnMain(func() {
+			cancelDownloadBtn.Disable()
+		})
+	}
+
+	cancelDownloadBtn = widget.NewButton("Cancel Download", func() {
+		cancelMu.Lock()
+		cancel := activeCancel
+		label := activeCancelLabel
+		cancelMu.Unlock()
+		if cancel == nil {
+			return
+		}
+
+		msg := "Cancel current internet download?\n\nPartial/intermediate files will be deleted where possible."
+		if strings.TrimSpace(label) != "" {
+			msg = fmt.Sprintf("Cancel current internet download (%s)?\n\nPartial/intermediate files will be deleted where possible.", label)
+		}
+		confirmText := "Cancel Download"
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "downloading ") {
+			confirmText = "Quit Application"
+		}
+		d := dialog.NewCustomConfirm(
+			"Cancel Download",
+			confirmText,
+			"Back",
+			widget.NewLabel(msg),
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				appendLog(logBox, "Cancel requested by user.", &logMu)
+				cancel()
+			},
+			w,
+		)
+		d.Resize(fyne.NewSize(520, 220))
+		d.Show()
+	})
+	cancelDownloadBtn.Disable()
 
 	var chooseFolder *widget.Button
 	chooseFolder = widget.NewButton(folderButtonText(downloadDir), func() {
@@ -1064,8 +1217,11 @@ func RunApp(assets Assets) {
 					if len(categoryOpts) == 0 {
 						appendLog(logBox, "No preferred subtitle category available.", &logMu)
 						if !askDownloadWithoutSubs(w) {
-							appendLog(logBox, "Download aborted by user (no subtitles available).", &logMu)
-							runOnMain(func() { status.SetText("Aborted") })
+							appendLog(logBox, "Download canceled by user (no subtitles available). Quitting application.", &logMu)
+							runOnMain(func() {
+								status.SetText("Quitting application...")
+								a.Quit()
+							})
 							return
 						}
 						appendLog(logBox, "Proceeding without subtitles.", &logMu)
@@ -1092,14 +1248,13 @@ func RunApp(assets Assets) {
 			})
 			appendLog(logBox, "Starting download...", &logMu)
 
-			runYTDLP(downloadURL, selectedFolder, selectedQuality, selectedProfile, ytdlpPath, ffmpegPath, selectedNameWithChannel, selectedPlaylist, selectedSub, w, logBox, nerdLogBox, status, progress, &logMu)
+			runYTDLP(downloadURL, selectedFolder, selectedQuality, selectedProfile, ytdlpPath, ffmpegPath, selectedNameWithChannel, selectedPlaylist, selectedSub, w, logBox, nerdLogBox, status, progress, &logMu, setCancelable, clearCancelable)
 		}()
 	})
 	btn.Disable()
 	go func() {
 		runOnMain(func() {
 			status.SetText("Checking required tools...")
-			progress.SetValue(0.05)
 		})
 		appendLog(logBox, "Required tools check...", &logMu)
 		for _, tool := range []string{"yt-dlp.exe", "ffmpeg.exe"} {
@@ -1121,39 +1276,137 @@ func RunApp(assets Assets) {
 			appendNerdLog(nerdLogBox, "[setup] missing tools: "+strings.Join(missing, ", "), &logMu)
 		}
 		appendLog(logBox, "Required tools check done.", &logMu)
-		runOnMain(func() { progress.SetValue(0.15) })
 		freshYTDLPDownloaded := false
 		if len(missing) > 0 {
 			appendLog(logBox, "Missing required tools: "+strings.Join(missing, ", "), &logMu)
 			if !askDownloadRequiredTools(w, missing) {
-				appendLog(logBox, "Setup aborted by user.", &logMu)
-				runOnMain(func() { status.SetText("Missing required tools") })
+				appendLog(logBox, "Setup canceled by user. Quitting application.", &logMu)
+				runOnMain(func() {
+					status.SetText("Quitting application...")
+					a.Quit()
+				})
 				return
 			}
 			runOnMain(func() { status.SetText("Downloading required tools...") })
-			totalMissing := len(missing)
-			for i, tool := range missing {
-				startP := 0.20 + (float64(i)/float64(totalMissing))*0.50
-				doneP := 0.20 + (float64(i+1)/float64(totalMissing))*0.50
-				runOnMain(func() { progress.SetValue(startP) })
-				appendLog(logBox, "Downloading "+tool+"...", &logMu)
-				appendNerdLog(nerdLogBox, "[setup] ensure "+tool, &logMu)
-				var data []byte
+			toolData := func(tool string) []byte {
 				switch tool {
 				case "yt-dlp.exe":
-					data = assets.YTDLP
-					freshYTDLPDownloaded = true
+					return assets.YTDLP
 				case "ffmpeg.exe":
-					data = assets.FFmpeg
+					return assets.FFmpeg
+				default:
+					return nil
 				}
-				if _, err := downloader.EnsureBinary(tool, data); err != nil {
+			}
+			downloadSlots := make(map[string]int)
+			for _, tool := range missing {
+				if len(toolData(tool)) == 0 {
+					downloadSlots[tool] = len(downloadSlots)
+				}
+			}
+			totalDownloads := len(downloadSlots)
+			for i, tool := range missing {
+				appendLog(logBox, "Downloading "+tool+"...", &logMu)
+				appendNerdLog(nerdLogBox, "[setup] ensure "+tool, &logMu)
+				data := toolData(tool)
+				if tool == "yt-dlp.exe" {
+					freshYTDLPDownloaded = true
+				}
+				slot, tracked := downloadSlots[tool]
+				progressCb := downloader.DownloadProgressFunc(nil)
+				if tracked {
+					progressCb = func(stats downloader.DownloadStats) {
+						switch stats.Phase {
+						case "start":
+							size := "unknown"
+							if stats.TotalBytes > 0 {
+								size = formatBytes(stats.TotalBytes)
+							}
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] download start %s <- %s (size: %s)", stats.Tool, stats.URL, size), &logMu)
+							runOnMain(func() {
+								status.SetText("Downloading " + stats.Tool + "...")
+							})
+						case "downloading":
+							if totalDownloads <= 0 || stats.TotalBytes <= 0 {
+								return
+							}
+							part := float64(stats.DownloadedBytes) / float64(stats.TotalBytes)
+							if part < 0 {
+								part = 0
+							}
+							if part > 1 {
+								part = 1
+							}
+							v := (float64(slot) + part) / float64(totalDownloads)
+							fileName := downloadDisplayName(stats)
+							runOnMain(func() {
+								progress.SetValue(v)
+								status.SetText(fmt.Sprintf("Downloading %s... %s / %s", fileName, formatBytes(stats.DownloadedBytes), formatBytes(stats.TotalBytes)))
+							})
+						case "done":
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] download done %s (%s)", stats.Tool, formatBytes(stats.DownloadedBytes)), &logMu)
+							if totalDownloads > 0 {
+								v := float64(slot+1) / float64(totalDownloads)
+								runOnMain(func() { progress.SetValue(v) })
+							}
+						case "extract_start":
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] extract start %s from archive", stats.Tool), &logMu)
+							runOnMain(func() { status.SetText("Extracting " + stats.Tool + "...") })
+						case "extract_done":
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] extract done %s", stats.Tool), &logMu)
+						case "retry":
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] retrying download %s from %s", stats.Tool, stats.URL), &logMu)
+							runOnMain(func() { status.SetText("Retrying " + stats.Tool + " download...") })
+						case "canceled":
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] canceled %s download; partial file removed", stats.Tool), &logMu)
+						}
+					}
+				}
+				toolCtx := context.Background()
+				toolCancel := context.CancelFunc(nil)
+				toolOpID := int64(0)
+				if tracked {
+					toolCtx, toolCancel = context.WithCancel(context.Background())
+					toolOpID = setCancelable("downloading "+tool, toolCancel)
+				}
+				if _, err := downloader.EnsureBinaryWithProgressCtx(toolCtx, tool, data, progressCb); err != nil {
+					if tracked {
+						clearCancelable(toolOpID)
+					}
+					if toolCancel != nil {
+						toolCancel()
+					}
+					if errors.Is(err, context.Canceled) {
+						if removed := downloader.CleanupDownloadTemps(); removed > 0 {
+							appendNerdLog(nerdLogBox, fmt.Sprintf("[setup] cleaned up %d temp download file(s)", removed), &logMu)
+							appendLog(logBox, fmt.Sprintf("Removed %d temporary download file(s).", removed), &logMu)
+						}
+						appendLog(logBox, fmt.Sprintf("Canceled %s download by user.", tool), &logMu)
+						runOnMain(func() {
+							status.SetText("Download canceled")
+							progress.SetValue(0)
+							a.Quit()
+						})
+						return
+					}
 					appendLog(logBox, fmt.Sprintf("Failed to prepare %s: %v", tool, err), &logMu)
 					runOnMain(func() { status.SetText("Setup failed") })
 					return
 				}
+				if tracked {
+					clearCancelable(toolOpID)
+				}
+				if toolCancel != nil {
+					toolCancel()
+				}
 				appendLog(logBox, tool+" is ready.", &logMu)
 				appendNerdLog(nerdLogBox, "[setup] "+tool+" ready", &logMu)
-				runOnMain(func() { progress.SetValue(doneP) })
+				if !tracked {
+					appendNerdLog(nerdLogBox, "[setup] "+tool+" prepared from embedded data (no network download)", &logMu)
+				}
+				if tracked && i == len(missing)-1 {
+					runOnMain(func() { status.SetText("All required downloads complete.") })
+				}
 			}
 		}
 		ytdlpPath, err := downloader.BinaryPath("yt-dlp.exe")
@@ -1175,16 +1428,16 @@ func RunApp(assets Assets) {
 		if freshYTDLPDownloaded {
 			appendLog(logBox, "yt-dlp update check skipped (fresh install).", &logMu)
 			appendLog(logBox, "yt-dlp update check done.", &logMu)
-			runOnMain(func() { progress.SetValue(0.95) })
 		} else {
 			appendLog(logBox, "yt-dlp update check...", &logMu)
 			runOnMain(func() {
 				status.SetText("Checking yt-dlp updates...")
-				progress.SetValue(0.75)
 			})
 			appendNerdLog(nerdLogBox, "> "+formatCommandLine(preparedYTDLPPath, []string{"--version"}), &logMu)
 			appendNerdLog(nerdLogBox, "> GET https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", &logMu)
-			downloader.TryUpdateYTDLP(preparedYTDLPPath, func(msg string) {
+			updateCtx, updateCancel := context.WithCancel(context.Background())
+			updateOpID := setCancelable("updating yt-dlp", updateCancel)
+			updateErr := downloader.TryUpdateYTDLPWithProgressCtx(updateCtx, preparedYTDLPPath, func(msg string) {
 				appendLog(logBox, msg, &logMu)
 				appendNerdLog(nerdLogBox, "[yt-dlp-update] "+msg, &logMu)
 				lower := strings.ToLower(msg)
@@ -1192,25 +1445,57 @@ func RunApp(assets Assets) {
 				case strings.Contains(lower, "updating yt-dlp"):
 					runOnMain(func() {
 						status.SetText("Updating yt-dlp...")
-						progress.SetValue(0.85)
 					})
 				case strings.Contains(lower, "update complete"):
 					runOnMain(func() {
 						status.SetText("yt-dlp update complete")
-						progress.SetValue(0.95)
 					})
 				case strings.Contains(lower, "up to date"):
 					runOnMain(func() {
 						status.SetText("yt-dlp is up to date")
-						progress.SetValue(0.95)
 					})
 				case strings.Contains(lower, "could not check latest yt-dlp version"):
 					runOnMain(func() {
 						status.SetText("Could not check yt-dlp updates")
-						progress.SetValue(0.80)
 					})
 				}
+			}, func(stats downloader.DownloadStats) {
+				switch stats.Phase {
+				case "start":
+					size := "unknown"
+					if stats.TotalBytes > 0 {
+						size = formatBytes(stats.TotalBytes)
+					}
+					appendNerdLog(nerdLogBox, fmt.Sprintf("[yt-dlp-update] download start %s (size: %s)", stats.URL, size), &logMu)
+				case "downloading":
+					if stats.TotalBytes <= 0 {
+						return
+					}
+					part := float64(stats.DownloadedBytes) / float64(stats.TotalBytes)
+					if part < 0 {
+						part = 0
+					}
+					if part > 1 {
+						part = 1
+					}
+					runOnMain(func() {
+						progress.SetValue(part)
+						status.SetText(fmt.Sprintf("Updating yt-dlp... %s / %s", formatBytes(stats.DownloadedBytes), formatBytes(stats.TotalBytes)))
+					})
+				case "done":
+					appendNerdLog(nerdLogBox, fmt.Sprintf("[yt-dlp-update] download done (%s)", formatBytes(stats.DownloadedBytes)), &logMu)
+					runOnMain(func() { progress.SetValue(1.0) })
+				}
 			})
+			clearCancelable(updateOpID)
+			updateCancel()
+			if errors.Is(updateErr, context.Canceled) {
+				appendLog(logBox, "yt-dlp update canceled by user.", &logMu)
+				runOnMain(func() {
+					status.SetText("yt-dlp update canceled")
+					progress.SetValue(0)
+				})
+			}
 			appendLog(logBox, "yt-dlp update check done.", &logMu)
 		}
 		toolsReady.Store(true)
@@ -1236,13 +1521,13 @@ func RunApp(assets Assets) {
 	controls := container.NewVBox(
 		widget.NewLabel("Portable yt-dlp Downloader"),
 		url,
-		container.NewHBox(chooseFolder, openFolder),
+		container.NewBorder(nil, nil, nil, openFolder, chooseFolder),
 		qualitySelect,
 		profileSelect,
 		nameWithChannel,
 		subsCheck,
 		playlistCheck,
-		container.NewHBox(btn, clear, clearNerd),
+		container.NewHBox(btn, cancelDownloadBtn, clear, clearNerd),
 		status,
 		progress,
 	)
