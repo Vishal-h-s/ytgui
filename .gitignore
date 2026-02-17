@@ -4,3 +4,8 @@ ffmpeg.exe
 yt-dlp.exe
 win_tools
 win_tools/*
+# release artifacts generated locally
+YoutubeVideoDownloader.exe
+YoutubeVideoDownloader.exe.asc
+YoutubeVideoDownloader.exe.sha256
+YoutubeVideoDownloader.exe.sha256.asc

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,6 +75,10 @@ func downloadLatest(ctx context.Context, client *http.Client, path string, progr
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	expectedSHA, err := resolveYTDLPSHA256(ctx)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestBinaryURL, nil)
 	if err != nil {
 		return err
@@ -126,10 +132,17 @@ func downloadLatest(ctx context.Context, client *http.Client, path string, progr
 			})
 		},
 	}
-	if _, err := io.Copy(out, io.TeeReader(reader, counter)); err != nil {
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(out, hash), io.TeeReader(reader, counter)); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err
+	}
+	actualSHA := hex.EncodeToString(hash.Sum(nil))
+	if actualSHA != expectedSHA {
+		out.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("yt-dlp.exe sha256 mismatch: expected %s, got %s", expectedSHA, actualSHA)
 	}
 
 	if err := out.Close(); err != nil {
